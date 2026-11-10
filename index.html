@@ -2870,6 +2870,7 @@
 const $=id=>document.getElementById(id),alphabet='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
 let packets=new Map(),meta=null,stream=null,scanning=false,lastText='',lastAt=0,blobUrl=null,assembledBlob=null,assembledFor=null,known=new Map(),scanCanvas=null,scanCtx=null,scanBusy=false;
 let equations=[],adjacency=[],decodeQueue=[],newlyKnown=[],chunkNodes=[],renderedTotal=-1,saveTimer=null,saving=false,unsavedPackets=0,packetArrivalTimes=[];
+let gaussBusy=false,gaussWorker=null,gaussLastPacketCount=0,gaussRank=0,gaussBlobUrl=null;
 function un45(s){let a=[];for(let i=0;i<s.length;i++){let n=alphabet.indexOf(s[i]);if(n<0)throw Error('Base45 字符无效');a.push(n)}let out=[];for(let i=0;i<a.length;){if(i+2<a.length){let v=a[i]+a[i+1]*45+a[i+2]*2025;if(v>65535)throw Error('Base45 数据溢出');out.push(v&255,v>>8);i+=3}else if(i+1<a.length){let v=a[i]+a[i+1]*45;if(v>255)throw Error('Base45 尾部数据无效');out.push(v);i+=2}else throw Error('Base45 长度无效')}return new Uint8Array(out)}
 const crcTable=(()=>{let t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?0xedb88320^(c>>>1):c>>>1;t[i]=c}return t})();function crc(s){let c=0xffffffff;for(let i=0;i<s.length;i++)c=(c>>>8)^crcTable[(c^s.charCodeAt(i))&255];return ((c^0xffffffff)>>>0).toString(36).padStart(5,'0').slice(-5)}function status(s){$('status').textContent=s}
 function fmt(n){if(n<1024)return n+' B';let a=['KB','MB','GB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<a.length-1);return n.toFixed(2)+' '+a[i]}
@@ -2877,17 +2878,76 @@ function decodeName(s){try{let b=atob(s),u=Uint8Array.from(b,c=>c.charCodeAt(0))
 function dbOpen(){return new Promise((resolve,reject)=>{let r=indexedDB.open('QRBridgeOffline_LT',1);r.onupgradeneeded=()=>r.result.createObjectStore('state');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
 async function saveState(){if(saving)return;saving=true;let db;try{db=await dbOpen();await new Promise((res,rej)=>{let tx=db.transaction('state','readwrite');tx.objectStore('state').put({packets:[...packets.entries()],meta},'current');tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});}catch(e){console.warn('保存进度失败',e)}finally{if(db)db.close();saving=false}}
 function scheduleSaveState(){unsavedPackets++;if(saveTimer)clearTimeout(saveTimer);const delay=unsavedPackets>=12?250:2200;saveTimer=setTimeout(()=>{saveTimer=null;unsavedPackets=0;saveState()},delay)}
-async function loadState(){try{let db=await dbOpen();let data=await new Promise((res,rej)=>{let r=db.transaction('state').objectStore('state').get('current');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});db.close();if(data){packets=new Map(data.packets||[]);meta=data.meta||null;rebuildDecoder();update()}}catch(e){status('本地进度读取失败：'+e.message)}}
+async function loadState(){try{let db=await dbOpen();let data=await new Promise((res,rej)=>{let r=db.transaction('state').objectStore('state').get('current');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});db.close();if(data){packets=new Map(data.packets||[]);meta=data.meta||null;rebuildDecoder();update();if(meta&&packets.size>=48)maybeRunGaussian()}}catch(e){status('本地进度读取失败：'+e.message)}}
 // 与发送端完全相同的 Robust Soliton 分布和 xorshift32 邻居选择。
 function rng32(seed){let x=(seed>>>0)||0x6d2b79f5;return ()=>{x^=x<<13;x^=x>>>17;x^=x<<5;return (x>>>0)/4294967296}}
 function degreeCdf(k){if(k<=1)return [1];const c=.1,delta=.05,R=c*Math.log(k/delta)*Math.sqrt(k),m=Math.max(1,Math.min(k,Math.floor(k/R)));let rho=new Float64Array(k+1),tau=new Float64Array(k+1),sum=0;rho[1]=1/k;for(let d=2;d<=k;d++)rho[d]=1/(d*(d-1));for(let d=1;d<m;d++)tau[d]=R/(d*k);if(m<=k)tau[m]=R*Math.log(R/delta)/k;for(let d=1;d<=k;d++)sum+=rho[d]+tau[d];let cdf=[],acc=0;for(let d=1;d<=k;d++){acc+=(rho[d]+tau[d])/sum;cdf.push(acc)}cdf[k-1]=1;return cdf}
 function neighbors(seed,k,cdf){const rnd=rng32(seed);let u=rnd(),d=1;while(d<k&&u>cdf[d-1])d++;const swaps=new Map(),out=[];for(let i=0;i<d;i++){const j=i+Math.floor(rnd()*(k-i));const vi=swaps.has(i)?swaps.get(i):i;const vj=swaps.has(j)?swaps.get(j):j;swaps.set(i,vj);swaps.set(j,vi);out.push(vj)}return out}
 function xorInto(a,b){for(let i=0;i<a.length;i++)a[i]^=b[i]}
-function resetDecoder(){known=new Map();newlyKnown=[];equations=[];decodeQueue=[];adjacency=meta?Array.from({length:meta.k},()=>[]):[];chunkNodes=[];renderedTotal=-1}
+function resetDecoder(){if(gaussWorker){try{gaussWorker.terminate()}catch(e){}gaussWorker=null}gaussBusy=false;gaussLastPacketCount=0;gaussRank=0;known=new Map();newlyKnown=[];equations=[];decodeQueue=[];adjacency=meta?Array.from({length:meta.k},()=>[]):[];chunkNodes=[];renderedTotal=-1}
 function propagateQueue(){while(decodeQueue.length){const e=decodeQueue.pop();if(e.ids.size!==1)continue;const id=e.ids.values().next().value;if(known.has(id))continue;const recovered=e.data.slice();known.set(id,recovered);newlyKnown.push(id);for(const linked of adjacency[id]){if(!linked.ids.has(id))continue;xorInto(linked.data,recovered);linked.ids.delete(id);if(linked.ids.size===1)decodeQueue.push(linked)}adjacency[id]=[]}}
 function addEquation(p){const data=un45(p.d);if(data.length!==meta.b)return false;const ids=new Set(neighbors(p.r,meta.k,decoderCdf));for(const id of [...ids]){const knownBlock=known.get(id);if(knownBlock){xorInto(data,knownBlock);ids.delete(id)}}if(!ids.size)return false;const e={ids,data};equations.push(e);for(const id of ids)adjacency[id].push(e);if(ids.size===1){decodeQueue.push(e);propagateQueue()}return true}
 let decoderCdf=null;
 function rebuildDecoder(){resetDecoder();if(!meta)return;decoderCdf=degreeCdf(meta.k);for(const p of packets.values()){if(p.f===meta.f&&p.k===meta.k&&p.b===meta.b&&p.l===meta.l){try{addEquation(p)}catch(e){console.warn('跳过无效编码包',e)}}}propagateQueue()}
+function gaussianWorkerSource(){return `
+self.onmessage=function(ev){
+ const input=ev.data, n=input.unknownIds.length, rows=input.rows;
+ const pos=new Map(); for(let i=0;i<n;i++)pos.set(input.unknownIds[i],i);
+ const basis=new Array(n); let rank=0;
+ function bitIndex(x){return x.toString(2).length-1}
+ function xor(a,b){for(let i=0;i<a.length;i++)a[i]^=b[i]}
+ for(let ri=0;ri<rows.length;ri++){
+  const row=rows[ri]; let mask=0n;
+  for(const id of row.ids){const p=pos.get(id);if(p!==undefined)mask|=(1n<<BigInt(p))}
+  if(mask===0n)continue;
+  let data=new Uint8Array(row.data);
+  while(mask){const low=mask&-mask,p=bitIndex(low),pivot=basis[p];
+   if(pivot){mask^=pivot.mask;xor(data,pivot.data)}else{basis[p]={mask,data};rank++;break}
+  }
+ }
+ if(rank!==n){self.postMessage({ok:false,rank,total:n});return}
+ const solution=new Array(n), transfers=[];
+ for(let p=n-1;p>=0;p--){const row=basis[p];if(!row){self.postMessage({ok:false,rank:0,total:n});return}
+  const value=row.data.slice();let rem=row.mask^(1n<<BigInt(p));
+  while(rem){const low=rem&-rem,j=bitIndex(low);if(!solution[j]){self.postMessage({ok:false,rank,total:n});return}xor(value,solution[j]);rem^=low}
+  solution[p]=value;
+ }
+ const out=[];for(let i=0;i<n;i++){out.push({id:input.unknownIds[i],data:solution[i].buffer});transfers.push(solution[i].buffer)}
+ self.postMessage({ok:true,rank,total:n,solutions:out},transfers);
+};`}
+function maybeRunGaussian(){
+ if(!meta||gaussBusy||known.size>=meta.k||packets.size-gaussLastPacketCount<48)return;
+ gaussLastPacketCount=packets.size;const unknownIds=[];for(let i=0;i<meta.k;i++)if(!known.has(i))unknownIds.push(i);
+ if(!unknownIds.length)return;
+ const rows=[];for(const e of equations)if(e.ids&&e.ids.size)rows.push({ids:Array.from(e.ids),data:e.data.slice().buffer});
+ if(rows.length<unknownIds.length)return;
+ gaussBusy=true;status(`剥离解码已恢复 ${known.size}/${meta.k}，正在进行矩阵补充解码…`);
+ const payload={unknownIds,rows};
+ const finish=(result)=>{
+  gaussBusy=false;if(gaussWorker){try{gaussWorker.terminate()}catch(e){}gaussWorker=null}if(gaussBlobUrl){try{URL.revokeObjectURL(gaussBlobUrl)}catch(e){}gaussBlobUrl=null}
+  if(result&&Number.isFinite(result.rank))gaussRank=result.rank;
+  if(result&&result.ok&&Array.isArray(result.solutions)){
+   let added=0;for(const item of result.solutions){if(!known.has(item.id)){const block=new Uint8Array(item.data);known.set(item.id,block);newlyKnown.push(item.id);added++}}
+   if(added){status(`矩阵解码成功，补充恢复 ${added} 个源数据块`);update();scheduleSaveState()}
+  }else if(result){status(`已接收 ${packets.size} 个编码包；剥离恢复 ${known.size}/${meta.k}，矩阵秩 ${result.rank||0}/${result.total||unknownIds.length}，继续接收编码包即可`)}
+ };
+ try{
+  const blob=new Blob([gaussianWorkerSource()],{type:'text/javascript'});gaussBlobUrl=URL.createObjectURL(blob);const worker=new Worker(gaussBlobUrl);gaussWorker=worker;
+  worker.onmessage=e=>finish(e.data);worker.onerror=e=>{console.warn('矩阵 Worker 不可用，切换主线程',e);try{worker.terminate()}catch(_){}gaussWorker=null;try{finish(runGaussianMain(payload))}catch(err){finish({ok:false,rank:0,total:unknownIds.length});console.error(err)}};
+  worker.postMessage(payload);
+ }catch(err){console.warn('无法创建矩阵 Worker，使用主线程',err);try{finish(runGaussianMain(payload))}catch(e){finish({ok:false,rank:0,total:unknownIds.length});console.error(e)}}
+}
+function runGaussianMain(input){
+ const n=input.unknownIds.length,pos=new Map();for(let i=0;i<n;i++)pos.set(input.unknownIds[i],i);const basis=new Array(n);let rank=0;
+ const bitIndex=x=>x.toString(2).length-1;const xor=(a,b)=>{for(let i=0;i<a.length;i++)a[i]^=b[i]};
+ for(const row of input.rows){let mask=0n;for(const id of row.ids){const p=pos.get(id);if(p!==undefined)mask|=1n<<BigInt(p)}if(!mask)continue;let data=new Uint8Array(row.data);
+  while(mask){const low=mask&-mask,p=bitIndex(low),pivot=basis[p];if(pivot){mask^=pivot.mask;xor(data,pivot.data)}else{basis[p]={mask,data};rank++;break}}
+ }
+ if(rank!==n)return {ok:false,rank,total:n};const solution=new Array(n);
+ for(let p=n-1;p>=0;p--){const row=basis[p];if(!row)return {ok:false,rank,total:n};const value=row.data.slice();let rem=row.mask^(1n<<BigInt(p));while(rem){const low=rem&-rem,j=bitIndex(low);if(!solution[j])return {ok:false,rank,total:n};xor(value,solution[j]);rem^=low}solution[p]=value}
+ return {ok:true,rank,total:n,solutions:solution.map((data,i)=>({id:input.unknownIds[i],data:data.buffer}))};
+}
+
 function update(){const total=meta?.k||0,n=known.size,p=total?Math.floor(n/total*100):0;$('count').textContent=n+' / '+total;$('bar').style.width=p+'%';$('percent').textContent=p+'%';$('finger').textContent='文件指纹：'+(meta?.f||'—');const recent=Date.now()-60000;packetArrivalTimes=packetArrivalTimes.filter(t=>t>=recent);$('scanStats').textContent=`唯一编码包：${packets.size} · 已恢复源块：${n}/${total} · 近 60 秒：${packetArrivalTimes.length} 包`;const grid=$('chunks');if(renderedTotal!==total){grid.innerHTML='';chunkNodes=[];if(total){const frag=document.createDocumentFragment();for(let i=0;i<total;i++){const d=document.createElement('div');d.className='chip';d.textContent=i+1;chunkNodes.push(d);frag.appendChild(d)}grid.appendChild(frag)}renderedTotal=total;for(const id of known.keys()){const node=chunkNodes[id];if(node)node.classList.add('done')}newlyKnown=[]}for(const id of newlyKnown){const node=chunkNodes[id];if(node)node.classList.add('done')}newlyKnown=[];if(meta){$('fileinfo').innerHTML=`<b>文件名：</b>${escapeHtml(decodeName(meta.n))}<br><b>文件大小：</b>${fmt(meta.s)}<br><b>源数据块：</b>${total}<br><b>已恢复：</b>${n}<br><b>编码包：</b>${packets.size}<br><b>文件指纹：</b>${meta.f}<br><b>发送时间：</b>${new Date(meta.ts).toLocaleString()}`}if(meta&&n===total&&total>0&&assembledFor!==meta.f)assemble()}
 async function accept(text){let o;try{o=JSON.parse(text)}catch(e){throw Error('二维码内容不是有效 JSON')}let changed=false;
  if(o.t==='meta'){
@@ -2895,14 +2955,14 @@ async function accept(text){let o;try{o=JSON.parse(text)}catch(e){throw Error('�
   if(crc(JSON.stringify(copy))!==o.h)throw Error('文件信息 CRC32 校验失败');
   if(!Number.isInteger(o.k)||o.k<1||o.k>200000||!Number.isInteger(o.b)||o.b<1||!Number.isInteger(o.l)||o.l<1)throw Error('文件元信息无效');
   const metaChanged=!meta||meta.f!==o.f||meta.k!==o.k||meta.b!==o.b||meta.l!==o.l;
-  if(metaChanged){if(meta&&meta.f!==o.f)packets.clear();meta=o;rebuildDecoder();changed=true;status('已收到文件信息：'+decodeName(o.n)+'，共 '+o.k+' 个源数据块')}
+  if(metaChanged){if(meta&&meta.f!==o.f)packets.clear();meta=o;rebuildDecoder();changed=true;if(packets.size>=48)maybeRunGaussian();status('已收到文件信息：'+decodeName(o.n)+'，共 '+o.k+' 个源数据块')}
   else {meta=o}
  }else if(o.t==='lt'){
   if(!Number.isInteger(o.r)||typeof o.d!=='string'||crc(o.d)!==o.h)throw Error('喷泉编码包 CRC32 校验失败');
   if(meta&&o.f!==meta.f)return status('忽略其他文件的编码包（文件指纹不匹配）');
   if(meta&&(o.k!==meta.k||o.b!==meta.b||o.l!==meta.l))throw Error('编码包参数与文件信息不一致');
   const key=String(o.r);
-  if(!packets.has(key)){packets.set(key,o);packetArrivalTimes.push(Date.now());changed=true;if(meta)addEquation(o);status(meta?`已接收编码包，恢复 ${known.size}/${meta.k} 个源块（累计 ${packets.size} 包）`:'已暂存编码包，请先扫描文件信息二维码')}
+  if(!packets.has(key)){packets.set(key,o);packetArrivalTimes.push(Date.now());changed=true;if(meta){addEquation(o);maybeRunGaussian()}status(meta?`已接收编码包，恢复 ${known.size}/${meta.k} 个源块（累计 ${packets.size} 包）`:'已暂存编码包，请先扫描文件信息二维码')}
  }else throw Error('不支持的二维码类型：'+String(o.t));
  if(changed){scheduleSaveState();update()}
 }
@@ -3031,4 +3091,5 @@ async function scanLoop(){
 }
 $('scan').onclick=startScan;$('clear').onclick=async()=>{if(!confirm('确定清除本地接收进度吗？'))return;packets.clear();meta=null;lastText='';unsavedPackets=0;packetArrivalTimes=[];resetDecoder();decoderCdf=null;assembledBlob=null;assembledFor=null;$('download').classList.add('hidden');$('fileinfo').textContent='尚未收到完整文件信息';let db=await dbOpen();db.transaction('state','readwrite').objectStore('state').delete('current');db.close();update();status('本地接收数据已清除。')};
 (async()=>{await loadState();try{let d=await navigator.mediaDevices?.enumerateDevices();for(let x of d||[])if(x.kind==='videoinput'){let op=document.createElement('option');op.value=x.deviceId;op.textContent=x.label||'摄像头';$('camera').appendChild(op)}}catch(e){}})();window.addEventListener('beforeunload',()=>{if(stream)stream.getTracks().forEach(t=>t.stop())});
+window.addEventListener('beforeunload',()=>{if(gaussWorker){try{gaussWorker.terminate()}catch(e){}}if(gaussBlobUrl){try{URL.revokeObjectURL(gaussBlobUrl)}catch(e){}}});
 </script></body></html>
