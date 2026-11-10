@@ -2869,36 +2869,43 @@
 
 const $=id=>document.getElementById(id),alphabet='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
 let packets=new Map(),meta=null,stream=null,scanning=false,lastText='',lastAt=0,blobUrl=null,assembledBlob=null,assembledFor=null,known=new Map(),scanCanvas=null,scanCtx=null,scanBusy=false;
+let equations=[],adjacency=[],decodeQueue=[],newlyKnown=[],chunkNodes=[],renderedTotal=-1,saveTimer=null,saving=false;
 function un45(s){let a=[];for(let i=0;i<s.length;i++){let n=alphabet.indexOf(s[i]);if(n<0)throw Error('Base45 字符无效');a.push(n)}let out=[];for(let i=0;i<a.length;){if(i+2<a.length){let v=a[i]+a[i+1]*45+a[i+2]*2025;if(v>65535)throw Error('Base45 数据溢出');out.push(v&255,v>>8);i+=3}else if(i+1<a.length){let v=a[i]+a[i+1]*45;if(v>255)throw Error('Base45 尾部数据无效');out.push(v);i+=2}else throw Error('Base45 长度无效')}return new Uint8Array(out)}
 const crcTable=(()=>{let t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?0xedb88320^(c>>>1):c>>>1;t[i]=c}return t})();function crc(s){let c=0xffffffff;for(let i=0;i<s.length;i++)c=(c>>>8)^crcTable[(c^s.charCodeAt(i))&255];return ((c^0xffffffff)>>>0).toString(36).padStart(5,'0').slice(-5)}function status(s){$('status').textContent=s}
 function fmt(n){if(n<1024)return n+' B';let a=['KB','MB','GB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<a.length-1);return n.toFixed(2)+' '+a[i]}
 function decodeName(s){try{let b=atob(s),u=Uint8Array.from(b,c=>c.charCodeAt(0));return new TextDecoder().decode(u)}catch(e){return 'received_file'}}function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function dbOpen(){return new Promise((resolve,reject)=>{let r=indexedDB.open('QRBridgeOffline_LT',1);r.onupgradeneeded=()=>r.result.createObjectStore('state');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
-async function saveState(){try{let db=await dbOpen();await new Promise((res,rej)=>{let tx=db.transaction('state','readwrite');tx.objectStore('state').put({packets:[...packets.entries()],meta},'current');tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});db.close()}catch(e){console.warn('保存进度失败',e)}}
+async function saveState(){if(saving)return;saving=true;let db;try{db=await dbOpen();await new Promise((res,rej)=>{let tx=db.transaction('state','readwrite');tx.objectStore('state').put({packets:[...packets.entries()],meta},'current');tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});}catch(e){console.warn('保存进度失败',e)}finally{if(db)db.close();saving=false}}
+function scheduleSaveState(){if(saveTimer)clearTimeout(saveTimer);saveTimer=setTimeout(()=>{saveTimer=null;saveState()},900)}
 async function loadState(){try{let db=await dbOpen();let data=await new Promise((res,rej)=>{let r=db.transaction('state').objectStore('state').get('current');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});db.close();if(data){packets=new Map(data.packets||[]);meta=data.meta||null;rebuildDecoder();update()}}catch(e){status('本地进度读取失败：'+e.message)}}
 // 与发送端完全相同的 Robust Soliton 分布和 xorshift32 邻居选择。
 function rng32(seed){let x=(seed>>>0)||0x6d2b79f5;return ()=>{x^=x<<13;x^=x>>>17;x^=x<<5;return (x>>>0)/4294967296}}
 function degreeCdf(k){if(k<=1)return [1];const c=.1,delta=.05,R=c*Math.log(k/delta)*Math.sqrt(k),m=Math.max(1,Math.min(k,Math.floor(k/R)));let rho=new Float64Array(k+1),tau=new Float64Array(k+1),sum=0;rho[1]=1/k;for(let d=2;d<=k;d++)rho[d]=1/(d*(d-1));for(let d=1;d<m;d++)tau[d]=R/(d*k);if(m<=k)tau[m]=R*Math.log(R/delta)/k;for(let d=1;d<=k;d++)sum+=rho[d]+tau[d];let cdf=[],acc=0;for(let d=1;d<=k;d++){acc+=(rho[d]+tau[d])/sum;cdf.push(acc)}cdf[k-1]=1;return cdf}
 function neighbors(seed,k,cdf){const rnd=rng32(seed);let u=rnd(),d=1;while(d<k&&u>cdf[d-1])d++;let a=Array.from({length:k},(_,i)=>i),out=[];for(let i=0;i<d;i++){let j=i+Math.floor(rnd()*(k-i));[a[i],a[j]]=[a[j],a[i]];out.push(a[i])}return out}
 function xorInto(a,b){for(let i=0;i<a.length;i++)a[i]^=b[i]}
-function rebuildDecoder(){known=new Map();if(!meta)return;const k=meta.k,cdf=degreeCdf(k),eqs=[];for(const p of packets.values()){if(p.f!==meta.f||p.k!==k||p.b!==meta.b||p.l!==meta.l)continue;const data=un45(p.d);if(data.length!==meta.b)continue;eqs.push({ids:new Set(neighbors(p.r,k,cdf)),data})}
- let changed=true,guard=0;while(changed&&guard++<k+eqs.length+5){changed=false;for(const e of eqs){for(const id of [...e.ids]){const b=known.get(id);if(b){xorInto(e.data,b);e.ids.delete(id)}}if(e.ids.size===1){const id=e.ids.values().next().value;if(!known.has(id)){known.set(id,e.data.slice());changed=true}}}}
-}
-function update(){let total=meta?.k||0,n=known.size,p=total?Math.floor(n/total*100):0;$('count').textContent=n+' / '+total;$('bar').style.width=p+'%';$('percent').textContent=p+'%';$('finger').textContent='文件指纹：'+(meta?.f||'—');$('chunks').innerHTML='';for(let i=0;i<total;i++){let d=document.createElement('div');d.className='chip'+(known.has(i)?' done':'');d.textContent=i+1;$('chunks').appendChild(d)}if(meta){$('fileinfo').innerHTML=`<b>文件名：</b>${escapeHtml(decodeName(meta.n))}<br><b>文件大小：</b>${fmt(meta.s)}<br><b>源数据块：</b>${total}<br><b>已恢复：</b>${n}<br><b>编码包：</b>${packets.size}<br><b>文件指纹：</b>${meta.f}<br><b>发送时间：</b>${new Date(meta.ts).toLocaleString()}`}if(meta&&n===total&&total>0&&assembledFor!==meta.f)assemble()}
+function resetDecoder(){known=new Map();newlyKnown=[];equations=[];decodeQueue=[];adjacency=meta?Array.from({length:meta.k},()=>[]):[];chunkNodes=[];renderedTotal=-1}
+function propagateQueue(){while(decodeQueue.length){const e=decodeQueue.pop();if(e.ids.size!==1)continue;const id=e.ids.values().next().value;if(known.has(id))continue;const recovered=e.data.slice();known.set(id,recovered);newlyKnown.push(id);for(const linked of adjacency[id]){if(!linked.ids.has(id))continue;xorInto(linked.data,recovered);linked.ids.delete(id);if(linked.ids.size===1)decodeQueue.push(linked)}adjacency[id]=[]}}
+function addEquation(p){const data=un45(p.d);if(data.length!==meta.b)return false;const ids=new Set(neighbors(p.r,meta.k,decoderCdf));for(const id of [...ids]){const knownBlock=known.get(id);if(knownBlock){xorInto(data,knownBlock);ids.delete(id)}}if(!ids.size)return false;const e={ids,data};equations.push(e);for(const id of ids)adjacency[id].push(e);if(ids.size===1){decodeQueue.push(e);propagateQueue()}return true}
+let decoderCdf=null;
+function rebuildDecoder(){resetDecoder();if(!meta)return;decoderCdf=degreeCdf(meta.k);for(const p of packets.values()){if(p.f===meta.f&&p.k===meta.k&&p.b===meta.b&&p.l===meta.l){try{addEquation(p)}catch(e){console.warn('跳过无效编码包',e)}}}propagateQueue()}
+function update(){const total=meta?.k||0,n=known.size,p=total?Math.floor(n/total*100):0;$('count').textContent=n+' / '+total;$('bar').style.width=p+'%';$('percent').textContent=p+'%';$('finger').textContent='文件指纹：'+(meta?.f||'—');const grid=$('chunks');if(renderedTotal!==total){grid.innerHTML='';chunkNodes=[];if(total){const frag=document.createDocumentFragment();for(let i=0;i<total;i++){const d=document.createElement('div');d.className='chip';d.textContent=i+1;chunkNodes.push(d);frag.appendChild(d)}grid.appendChild(frag)}renderedTotal=total;for(const id of known.keys()){const node=chunkNodes[id];if(node)node.classList.add('done')}newlyKnown=[]}for(const id of newlyKnown){const node=chunkNodes[id];if(node)node.classList.add('done')}newlyKnown=[];if(meta){$('fileinfo').innerHTML=`<b>文件名：</b>${escapeHtml(decodeName(meta.n))}<br><b>文件大小：</b>${fmt(meta.s)}<br><b>源数据块：</b>${total}<br><b>已恢复：</b>${n}<br><b>编码包：</b>${packets.size}<br><b>文件指纹：</b>${meta.f}<br><b>发送时间：</b>${new Date(meta.ts).toLocaleString()}`}if(meta&&n===total&&total>0&&assembledFor!==meta.f)assemble()}
 async function accept(text){let o;try{o=JSON.parse(text)}catch(e){throw Error('二维码内容不是有效 JSON')}
  if(o.t==='meta'){
   const copy={t:o.t,v:o.v,f:o.f,n:o.n,s:o.s,ts:o.ts,k:o.k,b:o.b,l:o.l};
   if(crc(JSON.stringify(copy))!==o.h)throw Error('文件信息 CRC32 校验失败');
   if(!Number.isInteger(o.k)||o.k<1||o.k>200000||!Number.isInteger(o.b)||o.b<1||!Number.isInteger(o.l)||o.l<1)throw Error('文件元信息无效');
-  if(meta&&meta.f!==o.f)packets.clear();meta=o;rebuildDecoder();status('已收到文件信息：'+decodeName(o.n)+'，共 '+o.k+' 个源数据块');
+  const changed=!meta||meta.f!==o.f||meta.k!==o.k||meta.b!==o.b||meta.l!==o.l;
+  if(changed){if(meta&&meta.f!==o.f)packets.clear();meta=o;rebuildDecoder();status('已收到文件信息：'+decodeName(o.n)+'，共 '+o.k+' 个源数据块')}
+  else {meta=o;status('文件信息已确认，继续接收编码包')}
  }else if(o.t==='lt'){
   if(!Number.isInteger(o.r)||typeof o.d!=='string'||crc(o.d)!==o.h)throw Error('喷泉编码包 CRC32 校验失败');
-  if(meta&&meta.f!==o.f)return status('忽略其他文件的编码包（文件指纹不匹配）');
+  if(meta&&o.f!==meta.f)return status('忽略其他文件的编码包（文件指纹不匹配）');
   if(meta&&(o.k!==meta.k||o.b!==meta.b||o.l!==meta.l))throw Error('编码包参数与文件信息不一致');
-  if(!packets.has(String(o.r))){packets.set(String(o.r),o);if(meta)rebuildDecoder()}
+  const key=String(o.r);
+  if(!packets.has(key)){packets.set(key,o);if(meta)addEquation(o)}
   status(meta?`已接收编码包，恢复 ${known.size}/${meta.k} 个源块（累计 ${packets.size} 包）`:'已暂存编码包，请先扫描文件信息二维码');
  }else throw Error('不支持的二维码类型：'+String(o.t));
- await saveState();update();
+ scheduleSaveState();update();
 }
 async function assemble(){try{if(!meta||known.size!==meta.k)return;let joined=new Uint8Array(meta.k*meta.b);for(let i=0;i<meta.k;i++){let b=known.get(i);if(!b)throw Error('源数据块缺失：'+i);joined.set(b,i*meta.b)}let compressed=joined.slice(0,meta.l),raw=pako.inflate(compressed);if(raw.length!==meta.s)throw Error(`文件大小校验失败：预期 ${meta.s}，实际 ${raw.length}`);let blob=new Blob([raw],{type:'application/octet-stream'});if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl=URL.createObjectURL(blob);assembledBlob=blob;assembledFor=meta.f;$('download').classList.remove('hidden');status('✅ 文件已完整重组。点击“保存 / 下载重组文件”；iPhone 将打开系统分享菜单，请选择“存储到文件”。');}catch(e){console.error(e);status('重组失败：'+e.message)}}
 
@@ -2997,7 +3004,7 @@ async function scanLoop(){
   scanBusy=true;
   try{
    // 将画面缩放到最长边 720px，降低 iPhone 上的逐帧解码负担。
-   const scale=Math.min(1,720/Math.max(video.videoWidth,video.videoHeight));
+   const scale=Math.min(1,560/Math.max(video.videoWidth,video.videoHeight));
    const w=Math.max(1,Math.round(video.videoWidth*scale));
    const h=Math.max(1,Math.round(video.videoHeight*scale));
    if(scanCanvas.width!==w||scanCanvas.height!==h){scanCanvas.width=w;scanCanvas.height=h}
@@ -3006,7 +3013,7 @@ async function scanLoop(){
    const result=window.jsQR(frame.data,w,h,{inversionAttempts:'dontInvert'});
    if(result&&result.data){
     const t=result.data,now=Date.now();
-    if(t!==lastText||now-lastAt>700){
+    if(t!==lastText||now-lastAt>2200){
      lastText=t;lastAt=now;
      try{await accept(t)}catch(e){status('识别到二维码，但数据无效：'+e.message)}
     }
@@ -3014,8 +3021,8 @@ async function scanLoop(){
   }catch(e){console.warn('jsQR scan error:',e)}
   finally{scanBusy=false}
  }
- if(scanning)setTimeout(scanLoop,110);
+ if(scanning)setTimeout(scanLoop,100);
 }
-$('scan').onclick=startScan;$('clear').onclick=async()=>{if(!confirm('确定清除本地接收进度吗？'))return;packets.clear();known.clear();meta=null;assembledBlob=null;assembledFor=null;$('download').classList.add('hidden');$('fileinfo').textContent='尚未收到完整文件信息';let db=await dbOpen();db.transaction('state','readwrite').objectStore('state').delete('current');db.close();update();status('本地接收数据已清除。')};
+$('scan').onclick=startScan;$('clear').onclick=async()=>{if(!confirm('确定清除本地接收进度吗？'))return;packets.clear();meta=null;resetDecoder();decoderCdf=null;assembledBlob=null;assembledFor=null;$('download').classList.add('hidden');$('fileinfo').textContent='尚未收到完整文件信息';let db=await dbOpen();db.transaction('state','readwrite').objectStore('state').delete('current');db.close();update();status('本地接收数据已清除。')};
 (async()=>{await loadState();try{let d=await navigator.mediaDevices?.enumerateDevices();for(let x of d||[])if(x.kind==='videoinput'){let op=document.createElement('option');op.value=x.deviceId;op.textContent=x.label||'摄像头';$('camera').appendChild(op)}}catch(e){}})();window.addEventListener('beforeunload',()=>{if(stream)stream.getTracks().forEach(t=>t.stop())});
 </script></body></html>
