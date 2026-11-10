@@ -2868,7 +2868,7 @@
 
 
 const $=id=>document.getElementById(id),alphabet='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
-let packets=new Map(),meta=null,stream=null,scanning=false,lastText='',lastAt=0,blobUrl=null,assembledFor=null,known=new Map(),scanCanvas=null,scanCtx=null,scanBusy=false;
+let packets=new Map(),meta=null,stream=null,scanning=false,lastText='',lastAt=0,blobUrl=null,assembledBlob=null,assembledFor=null,known=new Map(),scanCanvas=null,scanCtx=null,scanBusy=false;
 function un45(s){let a=[];for(let i=0;i<s.length;i++){let n=alphabet.indexOf(s[i]);if(n<0)throw Error('Base45 字符无效');a.push(n)}let out=[];for(let i=0;i<a.length;){if(i+2<a.length){let v=a[i]+a[i+1]*45+a[i+2]*2025;if(v>65535)throw Error('Base45 数据溢出');out.push(v&255,v>>8);i+=3}else if(i+1<a.length){let v=a[i]+a[i+1]*45;if(v>255)throw Error('Base45 尾部数据无效');out.push(v);i+=2}else throw Error('Base45 长度无效')}return new Uint8Array(out)}
 const crcTable=(()=>{let t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?0xedb88320^(c>>>1):c>>>1;t[i]=c}return t})();function crc(s){let c=0xffffffff;for(let i=0;i<s.length;i++)c=(c>>>8)^crcTable[(c^s.charCodeAt(i))&255];return ((c^0xffffffff)>>>0).toString(36).padStart(5,'0').slice(-5)}function status(s){$('status').textContent=s}
 function fmt(n){if(n<1024)return n+' B';let a=['KB','MB','GB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<a.length-1);return n.toFixed(2)+' '+a[i]}
@@ -2900,7 +2900,43 @@ async function accept(text){let o;try{o=JSON.parse(text)}catch(e){throw Error('�
  }else throw Error('不支持的二维码类型：'+String(o.t));
  await saveState();update();
 }
-async function assemble(){try{if(!meta||known.size!==meta.k)return;let joined=new Uint8Array(meta.k*meta.b);for(let i=0;i<meta.k;i++){let b=known.get(i);if(!b)throw Error('源数据块缺失：'+i);joined.set(b,i*meta.b)}let compressed=joined.slice(0,meta.l),raw=pako.inflate(compressed);if(raw.length!==meta.s)throw Error(`文件大小校验失败：预期 ${meta.s}，实际 ${raw.length}`);let blob=new Blob([raw],{type:'application/octet-stream'});if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl=URL.createObjectURL(blob);assembledFor=meta.f;$('download').classList.remove('hidden');status('✅ 喷泉码解码成功，文件已完整重组。点击“保存/下载文件”。');}catch(e){console.error(e);status('重组失败：'+e.message)}}
+async function assemble(){try{if(!meta||known.size!==meta.k)return;let joined=new Uint8Array(meta.k*meta.b);for(let i=0;i<meta.k;i++){let b=known.get(i);if(!b)throw Error('源数据块缺失：'+i);joined.set(b,i*meta.b)}let compressed=joined.slice(0,meta.l),raw=pako.inflate(compressed);if(raw.length!==meta.s)throw Error(`文件大小校验失败：预期 ${meta.s}，实际 ${raw.length}`);let blob=new Blob([raw],{type:'application/octet-stream'});if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl=URL.createObjectURL(blob);assembledBlob=blob;assembledFor=meta.f;$('download').classList.remove('hidden');status('✅ 文件已完整重组。点击“保存 / 下载重组文件”；iPhone 将打开系统分享菜单，请选择“存储到文件”。');}catch(e){console.error(e);status('重组失败：'+e.message)}}
+
+function getReceivedFileName(){
+ let name=decodeName(meta?.n||'received_file').trim()||'received_file';
+ name=name.replace(/[\\/:*?"<>|\x00-\x1F]/g,'_');
+ return name.slice(0,180)||'received_file';
+}
+function getReceivedMime(name){
+ const ext=(name.split('.').pop()||'').toLowerCase();
+ const types={pdf:'application/pdf',txt:'text/plain;charset=utf-8',html:'text/html;charset=utf-8',htm:'text/html;charset=utf-8',jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',gif:'image/gif',webp:'image/webp',mp3:'audio/mpeg',mp4:'video/mp4',zip:'application/zip',doc:'application/msword',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',xls:'application/vnd.ms-excel',xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',ppt:'application/vnd.ms-powerpoint',pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation'};
+ return types[ext]||'application/octet-stream';
+}
+$('download').addEventListener('click',async()=>{
+ if(!blobUrl||!assembledBlob||!meta){status('文件尚未完成重组，请确认接收进度已达到 100%。');return}
+ const btn=$('download');
+ const name=getReceivedFileName();
+ try{
+  btn.disabled=true;
+  const file=new File([assembledBlob],name,{type:getReceivedMime(name),lastModified:Date.now()});
+  const shareFiles=!!(navigator.canShare&&navigator.canShare({files:[file]}));
+  if(shareFiles&&navigator.share){
+   status('已准备好文件，正在打开系统分享菜单。请选择“存储到文件”即可保存。');
+   await navigator.share({files:[file],title:name});
+   status('系统分享操作已完成。请在“文件”App 中查看保存结果。');
+  }else if(!/iPhone|iPad|iPod/.test(navigator.userAgent)&&!(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1)){
+   const a=document.createElement('a');a.href=blobUrl;a.download=name;a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+   status('已触发文件下载：'+name);
+  }else{
+   const opened=window.open('about:blank','_blank');
+   if(opened){opened.location.href=blobUrl;status('已在新页面打开文件。请点击分享按钮，选择“存储到文件”。');}
+   else status('浏览器阻止了新窗口。请允许弹出窗口后再次点击保存，或通过 HTTPS 的 Safari 页面打开接收端。');
+  }
+ }catch(e){
+  if(e&&e.name==='AbortError')status('你已关闭系统分享菜单，文件仍保留在本页面，可再次点击保存。');
+  else{console.error('保存文件失败：',e);status('保存失败：'+(e?.message||e)+'。请再次点击保存；iPhone 可尝试使用 Safari 打开。');}
+ }finally{btn.disabled=false;}
+});
 $('submit').onclick=async()=>{try{await accept($('manual').value.trim());$('manual').value=''}catch(e){status('❌ '+e.message)}};
 
 async function stopScan(){
@@ -2980,6 +3016,6 @@ async function scanLoop(){
  }
  if(scanning)setTimeout(scanLoop,110);
 }
-$('scan').onclick=startScan;$('clear').onclick=async()=>{if(!confirm('确定清除本地接收进度吗？'))return;packets.clear();known.clear();meta=null;assembledFor=null;$('download').classList.add('hidden');$('fileinfo').textContent='尚未收到完整文件信息';let db=await dbOpen();db.transaction('state','readwrite').objectStore('state').delete('current');db.close();update();status('本地接收数据已清除。')};
+$('scan').onclick=startScan;$('clear').onclick=async()=>{if(!confirm('确定清除本地接收进度吗？'))return;packets.clear();known.clear();meta=null;assembledBlob=null;assembledFor=null;$('download').classList.add('hidden');$('fileinfo').textContent='尚未收到完整文件信息';let db=await dbOpen();db.transaction('state','readwrite').objectStore('state').delete('current');db.close();update();status('本地接收数据已清除。')};
 (async()=>{await loadState();try{let d=await navigator.mediaDevices?.enumerateDevices();for(let x of d||[])if(x.kind==='videoinput'){let op=document.createElement('option');op.value=x.deviceId;op.textContent=x.label||'摄像头';$('camera').appendChild(op)}}catch(e){}})();window.addEventListener('beforeunload',()=>{if(stream)stream.getTracks().forEach(t=>t.stop())});
 </script></body></html>
